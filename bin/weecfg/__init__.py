@@ -18,7 +18,7 @@ import tempfile
 import configobj
 
 import weeutil.weeutil
-from weewx.engine import all_service_groups
+from weewx import all_service_groups
 
 minor_comment_block = [""]
 major_comment_block = ["", "##############################################################################", ""]
@@ -62,8 +62,10 @@ canonical_order = ('',
  ('StdConvert', [], ['target_unit']), ('StdCalibrate', [('Corrections', [], [])], []), 
  ('StdQC', [('MinMax', [], ['barometer', 'outTemp', 'inTemp',
                             'outHumidity', 'inHumidity', 'windSpeed'])], []),
- ('StdWXCalculate', [], ['pressure', 'barometer', 'altimeter', 'windchill',
-                         'heatindex', 'dewpoint', 'inDewpoint', 'rainRate']), 
+ ('StdWXCalculate', [('Calculations', [], ['pressure', 'barometer', 'altimeter', 'windchill',
+                                           'heatindex', 'dewpoint', 'inDewpoint', 'rainRate']),
+                     ('Algorithms', [], ['altimeter', 'maxSolarRad'])],
+  ['ignore_zero_wind', 'rain_period', 'et_period', 'wind_height', 'atc', 'nfac', 'max_delta_12h']),
  ('StdTimeSynch', [], ['clock_check', 'max_drift']), 
  ('StdArchive', [], ['archive_interval', 'archive_delay', 'record_generation',
                      'loop_hilo', 'data_binding']), 
@@ -235,11 +237,11 @@ def save(config_dict, config_path, backup=False):
 
         # Now we can save the file. Get a temporary file:
         tmpfile = tempfile.NamedTemporaryFile("w")
-        
+
         # Write the configuration dictionary to it:
         config_dict.write(tmpfile)
         tmpfile.flush()
-    
+
         # Now move the temporary file into the proper place:
         shutil.copyfile(tmpfile.name, config_path)
 
@@ -295,6 +297,9 @@ def modify_config(config_dict, stn_info, logger, debug=False):
             # let the driver process the stanza or give us a new one
             stanza_text = driver_editor.get_conf(orig_stanza_text)
             stanza = configobj.ConfigObj(stanza_text.splitlines())
+
+            # let the driver modify other parts of the configuration
+            driver_editor.modify_config(config_dict)
         else:
             stanza = configobj.ConfigObj(interpolation=False)
             if driver_name in config_dict:
@@ -329,7 +334,9 @@ def modify_config(config_dict, stn_info, logger, debug=False):
                     logger.log("Using %s for %s" % (stn_info[p], p), level=2)
                 config_dict['Station'][p] = stn_info[p]
         # Update units display with any stn_info overrides
-        if stn_info.get('units') is not None:
+        if (stn_info.get('units') is not None and
+            'StdReport' in config_dict and
+            'StandardReport' in config_dict['StdReport']):
             if stn_info.get('units') in ['metric', 'metricwx']:
                 if debug:
                     logger.log("Using Metric units for display", level=2)
@@ -368,7 +375,11 @@ def update_config(config_dict):
     # assume a very old version:
     config_version = config_dict.get('version') or '1.0.0'
 
-    major, minor, _ = config_version.split('.')
+    # Updates only care about the major and minor numbers
+    parts = config_version.split('.')
+    major = parts[0]
+    minor = parts[1]
+
     # Take care of the collation problem when comparing things like
     # version '1.9' to '1.10' by prepending a '0' to the former:
     if len(minor) < 2:
@@ -386,6 +397,8 @@ def update_config(config_dict):
         update_to_v30(config_dict)
         
     update_to_v32(config_dict)
+    
+    update_to_v36(config_dict)
 
 def merge_config(config_dict, template_dict):
     """Merge the configuration dictionary into the template dictionary,
@@ -744,6 +757,43 @@ def update_to_v32(config_dict):
     
     config_dict['version'] = '3.2.0'
         
+def update_to_v36(config_dict):
+    """Update a configuration file to V3.6"""
+    
+    # Perform the following only if the dictionary has a StdWXCalculate section
+    if config_dict.get('StdWXCalculate'):
+        # No need to update if it already has a 'Calculations' section:
+        if not config_dict['StdWXCalculate'].get('Calculations'):
+            # Save the comment attached to the first scalar
+            try:
+                first = config_dict['StdWXCalculate'].scalars[0]
+                comment = config_dict['StdWXCalculate'].comments[first]
+                config_dict['StdWXCalculate'].comments[first] = ''
+            except IndexError:
+                comment = """    # Derived quantities are calculated by this service. Possible values are:
+    #  hardware        - use the value provided by hardware
+    #  software        - use the value calculated by weewx
+    #  prefer_hardware - use value provide by hardware if available,
+    #                      otherwise use value calculated by weewx"""
+            # Create a new 'Calculations' section:
+            config_dict['StdWXCalculate']['Calculations'] = {}
+            # Now transfer over the options. Make a copy of them first: we will be 
+            # deleting some of them.
+            scalars = list(config_dict['StdWXCalculate'].scalars)
+            for scalar in scalars:
+                # These scalars don't get moved:
+                if not scalar in ['ignore_zero_wind', 'rain_period', 
+                                  'et_period', 'wind_height', 'atc', 
+                                  'nfac', 'max_delta_12h']:
+                    config_dict['StdWXCalculate']['Calculations'][scalar] = config_dict['StdWXCalculate'][scalar]
+                    config_dict['StdWXCalculate'].pop(scalar)
+            # Insert the old comment at the top of the new stanza:
+            try:
+                first = config_dict['StdWXCalculate']['Calculations'].scalars[0]
+                config_dict['StdWXCalculate']['Calculations'].comments[first] = comment
+            except IndexError:
+                pass
+
 def transfer_comments(config_dict, template_dict):
     
     # If this is the top-level, transfer the initial comments
@@ -862,10 +912,9 @@ def reorder(name_list, ref_list):
     for name in name_list:
         if name not in ref_list:
             result.append(name)
-            
     # Finally, add these, so they are at the very end
     for name in ref_list:
-        if name in ['FTP', 'RSYNC']:
+        if name in name_list and name in ['FTP', 'RSYNC']:
             result.append(name)
             
     # Make sure I have the same number I started with
@@ -891,7 +940,7 @@ def prepend_path(a_dict, label, value):
         elif k == label:
             a_dict[k] = os.path.join(value, a_dict[k])
 
-#def replace_string(a_dict, label, value):
+# def replace_string(a_dict, label, value):
 #    for k in a_dict:
 #        if isinstance(a_dict[k], dict):
 #            replace_string(a_dict[k], label, value)
